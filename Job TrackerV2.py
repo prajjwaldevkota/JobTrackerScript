@@ -124,12 +124,16 @@ def fetch_jobs():
         # connect and search
         mail = connect_email()
         mail.select("INBOX")
-        typ, data = mail.uid('search', None,
-                             f'X-GM-RAW "category:primary after:{DATE_LIMIT}"'
-                             )
-        if typ != 'OK':
-            print("❌ IMAP search failed.")
-            return
+
+# Try category:primary first
+        typ, data = mail.uid(
+            'search', None, f'SINCE {DATE_LIMIT} X-GM-RAW "Category:Primary"')
+
+# If it fails or finds nothing, fall back to inbox search
+        if typ != 'OK' or not data[0]:
+            print("⚠️ Falling back to basic INBOX search.")
+            typ, data = mail.uid('search', None, f'SINCE "{DATE_LIMIT}"')
+
         uids = data[0].split()
         print(f"🔍 Found {len(uids)} messages in Primary since {DATE_LIMIT}")
 
@@ -147,7 +151,7 @@ def fetch_jobs():
             "support analyst",
             "application was sent",
             "Your online application has been successfully submitted",
-            "Help Desk Analyst"
+            "Help Desk Analyst", "Junior Software"
         ]
 
         # Blacklist - more specific patterns to exclude
@@ -176,12 +180,6 @@ def fetch_jobs():
                     continue
 
                 msg = email.message_from_bytes(msg_data[0][1])
-
-                gmail_labels = msg.get('X-Gmail-Labels', '')
-
-                if any(category in gmail_labels for category in ["DRAFT", "SPAM", "PROMOTIONS", "UPDATES", "SOCIAL"]):
-                    print(f"⏭️ Skipping email in category: {gmail_labels}")
-                    continue
 
                 subj = parse_subject(msg.get('Subject', ''))
                 sl = subj.lower()
