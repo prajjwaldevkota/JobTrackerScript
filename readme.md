@@ -80,6 +80,7 @@ DATE_LIMIT  = "YYYY-MM-DD"   # e.g. "2024-10-01"
         ```python
         APP_PASSWORD= "your_generated_app_password"
         ```
+        or add an env file and you can change it there.
     * Save the `job_tracker.py` file.
   
     ## 🎬 Usage
