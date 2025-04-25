@@ -14,8 +14,8 @@ load_dotenv()
 EMAIL = os.getenv("EMAIL")
 APP_PASSWORD = os.getenv("APP_PASSWORD")
 IMAP_SERVER = "imap.gmail.com"
-EXCEL_FILE = "job_applications.xlsx"
-DATE_LIMIT = "24-Apr-2025"
+EXCEL_FILE = "job_applications_cleaned.xlsx"
+DATE_LIMIT = "25-Apr-2025"
 
 
 def connect_email():
@@ -36,7 +36,7 @@ def extract_job_info(subject, sender):
     sl = subject.lower()
 
     # Status detection
-    if any(k in sl for k in ["rejected", "unsuccessful", "not selected", "not moving forward", "not proceeding", "thank you for the interest"]):
+    if any(k in sl for k in ["rejected", "unsuccessful", "not selected", "not moving forward", "not proceeding", "thank you for the interest", "update on your application"]):
         status = "Rejected"
     elif any(k in sl for k in ["offer", "congratulations", "welcome aboard", "pleased to offer"]):
         status = "Offer"
@@ -151,7 +151,8 @@ def fetch_jobs():
             "support analyst",
             "application was sent",
             "Your online application has been successfully submitted",
-            "Help Desk Analyst", "Junior Software"
+            "Help Desk Analyst", "Junior Software",
+            "Thank You for Applying",
         ]
 
         # Blacklist - more specific patterns to exclude
