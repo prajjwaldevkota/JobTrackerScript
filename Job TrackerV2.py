@@ -15,7 +15,7 @@ EMAIL = os.getenv("EMAIL")
 APP_PASSWORD = os.getenv("APP_PASSWORD")
 IMAP_SERVER = "imap.gmail.com"
 EXCEL_FILE = "job_applications_cleaned.xlsx"
-DATE_LIMIT = "25-Apr-2025"
+DATE_LIMIT = "28-May-2025"
 
 
 def connect_email():
@@ -32,36 +32,75 @@ def parse_subject(subj):
         return subj or ""
 
 
-def extract_job_info(subject, sender):
-    sl = subject.lower()
+def get_email_body(msg):
+    """Extract the email body content from the message"""
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition"))
 
-    # Status detection
-    if any(k in sl for k in ["rejected", "unsuccessful", "not selected", "not moving forward", "not proceeding", "thank you for the interest", "update on your application"]):
+            # Skip attachments
+            if "attachment" in content_disposition:
+                continue
+
+            if content_type == "text/plain" or content_type == "text/html":
+                try:
+                    body = part.get_payload(decode=True).decode()
+                    return body
+                except:
+                    pass
+    else:
+        # Not multipart - get payload directly
+        try:
+            body = msg.get_payload(decode=True).decode()
+            return body
+        except:
+            pass
+
+    return ""
+
+
+def extract_job_info(subject, sender, body=None):
+    sl = subject.lower()
+    body_text = body.lower() if body else ""
+
+    # Rejection phrases in email body
+    rejection_body_phrases = [
+        "at this time we are not proceeding",
+        "we are not proceeding with your application",
+        "unfortunately",
+        "we regret to inform you",
+        "we have decided to move forward with other candidates",
+        "we will not be progressing",
+        "not selected",
+        "not successful",
+        "we've decided not to move forward",
+        "thank you for your interest",
+        "position has been filled",
+        "no longer being considered",
+        "we have chosen another candidate",
+        "not a match",
+        "not the right fit"
+    ]
+
+    # give status a default
+    status = "Applied"
+
+    # Subject-based status detection
+    if body and any(phrase in body_text for phrase in rejection_body_phrases):
+        status = "Rejected"
+        print(f"Found rejection phrase in email body for: {subject}")
+    elif any(k in sl for k in ["rejected", "unsuccessful", "not selected", "not moving forward", "not proceeding", "thank you for the interest"]):
         status = "Rejected"
     elif any(k in sl for k in ["offer", "congratulations", "welcome aboard", "pleased to offer"]):
         status = "Offer"
-    elif any(k in sl for k in ["interview", "shortlisted", "next round", "next steps", "assessment"]):
+    elif any(k in sl for k in ["interview", "shortlisted", "next round", "next steps", "assessment", "interview scheduled", "interview confirmation"]):
         status = "Interview"
-    else:
-        status = "Applied"
 
-    # Improved regex for job title extraction
-    title_patterns = [
-        r'for\s+["\']?(.*?)["\']?\s+at',  # "for [title] at"
-        # "application for [title]"
-        r'application\s+for\s+["\']?(.*?)["\']?\s+',
-        r're:\s+["\']?(.*?)["\']?\s+application',  # "re: [title] application"
-        r'position:?\s+["\']?(.*?)["\']?(?:\s|$)'  # "position: [title]"
-    ]
-
+    # Job title extraction
     title = subject  # Default to full subject
-    for pattern in title_patterns:
-        tm = re.search(pattern, subject, re.IGNORECASE)
-        if tm:
-            title = tm.group(1)
-            break
 
-    # Improved company extraction
+    # Try to identify the company name first
     company_patterns = [
         r'at\s+["\']?([\w\s&\-\.]+?)["\']?(?:$|:|\.|\s\()',  # "at [company]"
         # "from [company]"
@@ -72,8 +111,36 @@ def extract_job_info(subject, sender):
     for pattern in company_patterns:
         cm = re.search(pattern, subject, re.IGNORECASE)
         if cm:
-            comp = cm.group(1)
+            comp = cm.group(1).strip()
             break
+
+    # If company was found, try to extract title by removing common phrases and the company
+    if comp:
+        # Common prefixes/suffixes to clean up
+        to_remove = [
+            f"at {comp}",
+            f"from {comp}",
+            "application for",
+            "thank you for your application",
+            "application received",
+            "your application for",
+            "re:",
+            "thank you for applying",
+            "application confirmation",
+            "application was sent",
+        ]
+
+        cleaned_title = subject
+        for phrase in to_remove:
+            cleaned_title = re.sub(re.escape(phrase), "",
+                                   cleaned_title, flags=re.IGNORECASE)
+
+        # Clean up extra whitespace and punctuation
+        title = re.sub(r'^\W+|\W+$', '', cleaned_title).strip()
+
+        # If title became empty, revert to subject
+        if not title:
+            title = subject
 
     # Fallback to email domain if no company found
     if not comp:
@@ -87,32 +154,52 @@ def extract_job_info(subject, sender):
 
     return title.strip(), comp.strip(), status
 
+
+def should_update_status(current_status, new_status):
+    """Determine if status should be updated based on hierarchy of statuses"""
+    status_hierarchy = {
+        "Applied": 0,
+        "Interview": 1,
+        "Offer": 2,
+        "Rejected": 3  # Rejection is final state
+    }
+
+    # Only update if new status is "higher" in the hierarchy
+    return status_hierarchy.get(new_status, 0) > status_hierarchy.get(current_status, 0)
+
+
 # === MAIN ===
-
-
 def fetch_jobs():
-    # Prepare workbook and existing sets
+    # Load existing workbook and prepare data structures
+    companies_map = {}  # Company name -> list of row indices
     existing_uids = set()
-    existing_keys = set()
+    uid_column_index = 5  # 0-based index for UID column (column F)
+
     if os.path.exists(EXCEL_FILE):
         wb = openpyxl.load_workbook(EXCEL_FILE)
         sheet = wb.active
         headers = [c.value for c in sheet[1]]
-        # ensure UID column
+
+        # Ensure UID column
         if "UID" not in headers:
             sheet.cell(row=1, column=len(headers)+1, value="UID")
             wb.save(EXCEL_FILE)
-        for row in sheet.iter_rows(min_row=2, values_only=True):
+
+        # Load existing data and build lookup maps
+        for row_idx, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
             # Handle variable number of columns
             row_data = list(row) + [None] * (6 - len(row))
-            date_val, title_val, comp_val, stat_val, sender_val, uid_val = row_data
-            t = (title_val or "").strip().lower()
-            c = (comp_val or "").strip().lower()
-            s = (stat_val or "").strip()
+            date_val, title_val, comp_val, status_val, sender_val, uid_val = row_data
+
             if uid_val:
                 existing_uids.add(str(uid_val))
-            else:
-                existing_keys.add((t, c, s))
+
+            # Build company name -> row index map for quick lookups
+            if comp_val:
+                comp_key = comp_val.strip().lower()
+                if comp_key not in companies_map:
+                    companies_map[comp_key] = []
+                companies_map[comp_key].append(row_idx)
     else:
         wb = openpyxl.Workbook()
         sheet = wb.active
@@ -121,15 +208,15 @@ def fetch_jobs():
         wb.save(EXCEL_FILE)
 
     try:
-        # connect and search
+        # Connect and search emails
         mail = connect_email()
         mail.select("INBOX")
 
-# Try category:primary first
+        # Try category:primary first
         typ, data = mail.uid(
             'search', None, f'SINCE {DATE_LIMIT} X-GM-RAW "Category:Primary"')
 
-# If it fails or finds nothing, fall back to inbox search
+        # If it fails or finds nothing, fall back to inbox search
         if typ != 'OK' or not data[0]:
             print("⚠️ Falling back to basic INBOX search.")
             typ, data = mail.uid('search', None, f'SINCE "{DATE_LIMIT}"')
@@ -146,7 +233,6 @@ def fetch_jobs():
             "interview",
             "shortlisted",
             "internship",
-            "service desk",
             "technical support",
             "support analyst",
             "application was sent",
@@ -166,10 +252,13 @@ def fetch_jobs():
             "job opportunity", "one of the first",
             "be a great fit", "webinar",
             "newsletter", "unsubscribe",
-            "career fair", "notification", "event", "first", "apply to", "actively recruiting", "you would be a great fit", "and more"
+            "career fair", "notification", "event", "first", "apply to", "actively recruiting", "you would be a great fit", "and more",
+            "glassdoor", "juli"
         ]
 
         new_rows = []
+        updated_rows = []  # Track which rows were updated
+
         for uid in uids:
             uid_str = uid.decode() if isinstance(uid, bytes) else str(uid)
             if uid_str in existing_uids:
@@ -185,6 +274,9 @@ def fetch_jobs():
                 subj = parse_subject(msg.get('Subject', ''))
                 sl = subj.lower()
                 sender = msg.get('From', '')
+
+                # Extract email body for additional rejection analysis
+                body = get_email_body(msg)
 
                 # Check inclusion criteria - must have one of the keywords
                 if not any(kw.lower() in sl for kw in include_kw):
@@ -210,31 +302,57 @@ def fetch_jobs():
                 except:
                     date_str = datetime.now().strftime('%Y-%m-%d')
 
-                title, comp, status = extract_job_info(subj, sender)
-                key = (title.lower(), comp.lower(), status)
-                if key in existing_keys:
-                    continue
+                title, comp, status = extract_job_info(subj, sender, body)
+                comp_key = comp.lower()
 
-                new_rows.append(
-                    (date_str, title, comp, status, sender, uid_str))
-                existing_uids.add(uid_str)
-                existing_keys.add(key)
-                print(f"📌 New job: {title} at {comp} ({status}) - {subj}")
+                # Check if we already have an application for this company
+                updated = False
+                if comp_key in companies_map:
+                    # Look through all entries for this company
+                    for row_idx in companies_map[comp_key]:
+                        # Get current data from spreadsheet
+                        current_data = [sheet.cell(
+                            row=row_idx, column=i).value for i in range(1, 7)]
+                        current_date, current_title, current_company, current_status, current_sender, current_uid = current_data
+
+                        # If status is "Applied" or "Interview" and new status is more definitive, update it
+                        if current_status and should_update_status(current_status, status):
+                            # Update status and add new UID
+                            sheet.cell(row=row_idx, column=4,
+                                       value=status)  # Update status
+                            sheet.cell(row=row_idx, column=6,
+                                       value=uid_str)  # Update UID
+
+                            print(
+                                f"🔄 Updated: {current_title} at {current_company} from '{current_status}' to '{status}'")
+                            updated_rows.append(row_idx)
+                            existing_uids.add(uid_str)
+                            updated = True
+                            break
+
+                # If not updated, add as a new entry
+                if not updated:
+                    new_rows.append(
+                        (date_str, title, comp, status, sender, uid_str))
+                    existing_uids.add(uid_str)
+                    print(f"📌 New job: {title} at {comp} ({status}) - {subj}")
 
             except Exception as e:
                 print(f"⚠️ Error processing email UID {uid_str}: {str(e)}")
 
         mail.logout()
 
-        if new_rows:
-            wb = openpyxl.load_workbook(EXCEL_FILE)
-            sheet = wb.active
+        # Save changes to workbook
+        if new_rows or updated_rows:
+            # Add new rows
             for row in new_rows:
                 sheet.append(row)
+
             wb.save(EXCEL_FILE)
-            print(f"✅ Appended {len(new_rows)} new jobs.")
+            print(
+                f"✅ Appended {len(new_rows)} new jobs and updated {len(updated_rows)} existing entries.")
         else:
-            print("ℹ️ No new jobs to add.")
+            print("ℹ️ No new jobs to add or update.")
 
     except Exception as e:
         print(f"❌ Error: {str(e)}")
